@@ -184,6 +184,11 @@ class WellDataset(Dataset):
             deviation is lower than this value, it is replaced by this value.
         storage_options :
             Option for the ffspec storage.
+        slab :
+            Optional (axis, start, stop): read only points start:stop of spatial
+            axis `axis` from each sample (e.g. one GPU's part of a domain split
+            across GPUs). Fields and the space grid are cut; metadata, scalars and
+            boundary conditions still describe the full domain.
     """
 
     def __init__(
@@ -217,6 +222,7 @@ class WellDataset(Dataset):
         transform: Optional["Augmentation"] = None,
         min_std: float = 1e-4,
         storage_options: Optional[Dict] = None,
+        slab: Optional[Tuple[int, int, int]] = None,
     ):
         super().__init__()
         assert path is not None or (
@@ -324,6 +330,16 @@ class WellDataset(Dataset):
         self.caches = [{} for _ in self.files_paths]
         # Build multi-index
         self.metadata = self._build_metadata()
+        self.slab = None
+        if slab is not None:
+            axis, start, stop = map(int, slab)
+            if not 0 <= axis < self.n_spatial_dims:
+                raise ValueError(f"Slab axis {axis} out of range")
+            if not 0 <= start < stop <= self.size_tuple[axis]:
+                raise ValueError(
+                    f"Slab {start}:{stop} out of range for axis of size {self.size_tuple[axis]}"
+                )
+            self.slab = (axis, start, stop)
         # Override name if necessary for logging
         if name_override is not None:
             self.dataset_name = name_override
@@ -563,6 +579,25 @@ class WellDataset(Dataset):
             n_steps_per_trajectory=self.n_steps_per_trajectory,
         )
 
+    def _spatial_cache_key(self, name: str) -> str:
+        """Cache key for data cut to the slab, so a changed slab is not served stale data."""
+        return name if self.slab is None else f"{name}@slab{self.slab}"
+
+    def _slab_index(self, use_dims) -> tuple:
+        """Index over a field's stored spatial dims that selects the slab."""
+        if self.slab is None:
+            return ()
+        axis, start, stop = self.slab
+        if not use_dims[axis]:
+            return ()  # Stored with size 1; _pad_axes tiles it to the slab width
+        return (slice(None),) * axis + (slice(start, stop),)
+
+    def _spatial_size(self, i: int) -> int:
+        """Size of spatial axis i as returned (the slab width on the slab axis)."""
+        if self.slab is not None and self.slab[0] == i:
+            return self.slab[2] - self.slab[1]
+        return self.size_tuple[i]
+
     def _check_cache(self, cache: Dict[str, Any], name: str, data: Any):
         if self.cache_small and data.numel() < self.max_cache_size:
             cache[name] = data
@@ -579,7 +614,7 @@ class WellDataset(Dataset):
         expand_dims = (1,) if time_varying else ()
         expand_dims = expand_dims + tuple(
             [
-                self.size_tuple[i] if not use_dim else 1
+                self._spatial_size(i) if not use_dim else 1
                 for i, use_dim in enumerate(use_dims)
             ]
         )
@@ -599,9 +634,10 @@ class WellDataset(Dataset):
             for field_name in field_names:
                 field = file[order_fields][field_name]
                 use_dims = field.attrs["dim_varying"]
+                cache_key = self._spatial_cache_key(field_name)
                 # If the field is in the cache, use it, otherwise go through read/pad
-                if field_name in cache:
-                    field_data = cache[field_name]
+                if cache_key in cache:
+                    field_data = cache[cache_key]
                 else:
                     field_data = field
                     # Index is built gradually since there can be different numbers of leading fields
@@ -612,6 +648,8 @@ class WellDataset(Dataset):
                         multi_index = multi_index + (
                             slice(time_idx, time_idx + n_steps * dt, dt),
                         )
+                    # h5py reads only the slab's points from disk
+                    multi_index = multi_index + self._slab_index(use_dims)
                     field_data = field_data[multi_index]
                     field_data = torch.as_tensor(field_data)
                     # Normalize
@@ -622,7 +660,7 @@ class WellDataset(Dataset):
                         not field.attrs["time_varying"]
                         and not field.attrs["sample_varying"]
                     ):
-                        self._check_cache(cache, field_name, field_data)
+                        self._check_cache(cache, cache_key, field_data)
 
                 # Expand dims
                 field_data = self._pad_axes(
@@ -697,21 +735,24 @@ class WellDataset(Dataset):
             time_grid = time_grid - time_grid.min()
 
         # Space - TODO - support time-varying grids or non-tensor product grids
-        if "space_grid" in cache:
-            space_grid = cache["space_grid"]
+        grid_key = self._spatial_cache_key("space_grid")
+        if grid_key in cache:
+            space_grid = cache[grid_key]
         else:
             space_grid = []
             sample_invariant = True
-            for dim in file["dimensions"].attrs["spatial_dims"]:
+            for i, dim in enumerate(file["dimensions"].attrs["spatial_dims"]):
                 if file["dimensions"][dim].attrs["sample_varying"]:
                     sample_invariant = False
                     coords = torch.tensor(file["dimensions"][dim][sample_idx])
                 else:
                     coords = torch.tensor(file["dimensions"][dim][:])
+                if self.slab is not None and self.slab[0] == i:
+                    coords = coords[self.slab[1] : self.slab[2]]
                 space_grid.append(coords)
             space_grid = torch.stack(torch.meshgrid(*space_grid, indexing="ij"), -1)
             if sample_invariant:
-                self._check_cache(cache, "space_grid", space_grid)
+                self._check_cache(cache, grid_key, space_grid)
         return space_grid, time_grid
 
     def _padding_bcs(self, file: h5.File, cache, sample_idx, time_idx, n_steps, dt):
