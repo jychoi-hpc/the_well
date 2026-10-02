@@ -608,8 +608,11 @@ class WellDataset(Dataset):
         use_dims,
         time_varying: bool = False,
         tensor_order: int = 0,
+        copy: bool = True,
     ):
-        """Repeats data over axes not used in storage"""
+        """Repeats data over axes not used in storage. With copy=False and
+        nothing to repeat, returns field_data itself (for freshly read data
+        that nothing else holds) instead of an identical copy."""
         # Look at which dimensions currently are not used and tile based on their sizes
         expand_dims = (1,) if time_varying else ()
         expand_dims = expand_dims + tuple(
@@ -619,6 +622,8 @@ class WellDataset(Dataset):
             ]
         )
         expand_dims = expand_dims + (1,) * tensor_order
+        if not copy and all(e == 1 for e in expand_dims) and len(expand_dims) == field_data.dim():
+            return field_data
         return torch.tile(field_data, expand_dims)
 
     def _reconstruct_fields(
@@ -636,7 +641,8 @@ class WellDataset(Dataset):
                 use_dims = field.attrs["dim_varying"]
                 cache_key = self._spatial_cache_key(field_name)
                 # If the field is in the cache, use it, otherwise go through read/pad
-                if cache_key in cache:
+                from_cache = cache_key in cache
+                if from_cache:
                     field_data = cache[cache_key]
                 else:
                     field_data = field
@@ -668,6 +674,12 @@ class WellDataset(Dataset):
                     use_dims,
                     time_varying=field.attrs["time_varying"],
                     tensor_order=i,
+                    # A cached tensor must not be handed out (callers may
+                    # modify their copy in place); freshly read data may
+                    copy=from_cache or (
+                        not field.attrs["time_varying"]
+                        and not field.attrs["sample_varying"]
+                    ),
                 )
 
                 if field.attrs["time_varying"]:
