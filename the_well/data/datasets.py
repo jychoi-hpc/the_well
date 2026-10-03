@@ -340,6 +340,12 @@ class WellDataset(Dataset):
                     f"Slab {start}:{stop} out of range for axis of size {self.size_tuple[axis]}"
                 )
             self.slab = (axis, start, stop)
+        # Optional object holding time-varying fields in memory (e.g. Walrus's
+        # DDStore source). Its read(path, field_key, sample_idx, time_idx,
+        # n_steps, dt, slab) returns the array the HDF5 read below would, or
+        # None to fall back to the file.
+        self.field_source = None
+        self._reading_path = None
         # Override name if necessary for logging
         if name_override is not None:
             self.dataset_name = name_override
@@ -645,6 +651,21 @@ class WellDataset(Dataset):
                 if from_cache:
                     field_data = cache[cache_key]
                 else:
+                    field_data = None
+                    if (
+                        self.field_source is not None
+                        and field.attrs["time_varying"]
+                        and field.attrs["sample_varying"]
+                    ):
+                        field_data = self.field_source.read(
+                            self._reading_path, f"{order_fields}/{field_name}",
+                            sample_idx, time_idx, n_steps, dt, self.slab,
+                        )
+                if not from_cache and field_data is not None:
+                    field_data = torch.as_tensor(field_data)
+                    if self.use_normalization and self.norm:
+                        field_data = self.norm.normalize(field_data, field_name)
+                elif not from_cache:
                     field_data = field
                     # Index is built gradually since there can be different numbers of leading fields
                     multi_index = ()
@@ -872,6 +893,7 @@ class WellDataset(Dataset):
             if self.full_trajectory_mode and self.start_output_steps_at_t >= 0:
                 time_idx = self.start_output_steps_at_t - (self.n_steps_input) * dt
 
+            self._reading_path = self.files_paths[file_idx]
             data["variable_fields"], data["constant_fields"] = self._reconstruct_fields(
                 file,
                 self.caches[file_idx],
