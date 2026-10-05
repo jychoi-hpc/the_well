@@ -1,3 +1,4 @@
+import contextvars
 import itertools
 import os
 import warnings
@@ -31,6 +32,11 @@ from the_well.data.utils import (
     raw_steps_to_possible_sample_t0s,
 )
 from the_well.utils.export import hdf5_to_xarray
+
+# File being read by _load_one_sample, for WellDataset.field_source. Kept per
+# thread (a context variable, not an attribute) because loader threads may
+# read several samples of one dataset at once.
+_READING_PATH: contextvars.ContextVar = contextvars.ContextVar("well_reading_path", default=None)
 
 if TYPE_CHECKING:
     from the_well.data.augmentation import Augmentation
@@ -345,7 +351,6 @@ class WellDataset(Dataset):
         # n_steps, dt, slab) returns the array the HDF5 read below would, or
         # None to fall back to the file.
         self.field_source = None
-        self._reading_path = None
         # Override name if necessary for logging
         if name_override is not None:
             self.dataset_name = name_override
@@ -658,7 +663,7 @@ class WellDataset(Dataset):
                         and field.attrs["sample_varying"]
                     ):
                         field_data = self.field_source.read(
-                            self._reading_path, f"{order_fields}/{field_name}",
+                            _READING_PATH.get(), f"{order_fields}/{field_name}",
                             sample_idx, time_idx, n_steps, dt, self.slab,
                         )
                 if not from_cache and field_data is not None:
@@ -893,7 +898,7 @@ class WellDataset(Dataset):
             if self.full_trajectory_mode and self.start_output_steps_at_t >= 0:
                 time_idx = self.start_output_steps_at_t - (self.n_steps_input) * dt
 
-            self._reading_path = self.files_paths[file_idx]
+            _READING_PATH.set(self.files_paths[file_idx])  # for field_source
             data["variable_fields"], data["constant_fields"] = self._reconstruct_fields(
                 file,
                 self.caches[file_idx],
