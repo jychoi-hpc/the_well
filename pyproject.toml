@@ -37,7 +37,7 @@ dependencies = [
     "h5py>=3.9.0",
     "numpy>=1.20",
     "pyyaml>=6.0",
-    "torch>=2.1",
+    "torch>=2.1",  # install torch first from the platform's index
     "fsspec==2024.10.0",
 ]
 classifiers = [
